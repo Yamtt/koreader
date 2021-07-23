@@ -1,6 +1,6 @@
-local Cache = require("cache")
 local CacheItem = require("cacheitem")
 local CanvasContext = require("document/canvascontext")
+local DocCache = require("document/doccache")
 local DocSettings = require("docsettings")
 local Document = require("document/document")
 local DrawContext = require("ffi/drawcontext")
@@ -139,7 +139,7 @@ end
 
 function PdfDocument:getUsedBBox(pageno)
     local hash = "pgubbox|"..self.file.."|"..self.reflowable_font_size.."|"..pageno
-    local cached = Cache:check(hash)
+    local cached = DocCache:check(hash)
     if cached then
         return cached.ubbox
     end
@@ -152,9 +152,9 @@ function PdfDocument:getUsedBBox(pageno)
     if used.x1 > pwidth then used.x1 = pwidth end
     if used.y0 < 0 then used.y0 = 0 end
     if used.y1 > pheight then used.y1 = pheight end
-    --- @todo Give size for cacheitem?  02.12 2012 (houqp)
-    Cache:insert(hash, CacheItem:new{
+    DocCache:insert(hash, CacheItem:new{
         ubbox = used,
+        size = 256, -- might be closer to 160
     })
     page:close()
     return used
@@ -162,14 +162,15 @@ end
 
 function PdfDocument:getPageLinks(pageno)
     local hash = "pglinks|"..self.file.."|"..self.reflowable_font_size.."|"..pageno
-    local cached = Cache:check(hash)
+    local cached = DocCache:check(hash)
     if cached then
         return cached.links
     end
     local page = self._document:openPage(pageno)
     local links = page:getPageLinks()
-    Cache:insert(hash, CacheItem:new{
+    DocCache:insert(hash, CacheItem:new{
         links = links,
+        size = 64 + (8 * 32 * #links),
     })
     page:close()
     return links
@@ -207,6 +208,20 @@ local function _quadpointsFromPboxes(pboxes)
     return quadpoints, n
 end
 
+local function _quadpointsToPboxes(quadpoints, n)
+    -- reverse of previous function
+    local pboxes = {}
+    for i=1, n do
+        table.insert(pboxes, {
+            x = quadpoints[8*i-4],
+            y = quadpoints[8*i-3],
+            w = quadpoints[8*i-6] - quadpoints[8*i-4],
+            h = quadpoints[8*i-5] - quadpoints[8*i-3],
+        })
+    end
+    return pboxes
+end
+
 function PdfDocument:saveHighlight(pageno, item)
     local can_write = self:_checkIfWritable()
     if can_write ~= true then return can_write end
@@ -222,8 +237,12 @@ function PdfDocument:saveHighlight(pageno, item)
     elseif item.drawer == "strikeout" then
         annot_type = C.PDF_ANNOT_STRIKEOUT
     end
-    page:addMarkupAnnotation(quadpoints, n, annot_type)
+    page:addMarkupAnnotation(quadpoints, n, annot_type) -- may update/adjust quadpoints
+    -- Update pboxes with the possibly adjusted coordinates (this will have it updated
+    -- in self.view.highlight.saved[page])
+    item.pboxes = _quadpointsToPboxes(quadpoints, n)
     page:close()
+    self:resetTileCacheValidity()
 end
 
 function PdfDocument:deleteHighlight(pageno, item)
@@ -236,6 +255,7 @@ function PdfDocument:deleteHighlight(pageno, item)
     local annot = page:getMarkupAnnotation(quadpoints, n)
     if annot ~= nil then
         page:deleteMarkupAnnotation(annot)
+        self:resetTileCacheValidity()
     end
     page:close()
 end
@@ -250,6 +270,7 @@ function PdfDocument:updateHighlightContents(pageno, item, contents)
     local annot = page:getMarkupAnnotation(quadpoints, n)
     if annot ~= nil then
         page:updateMarkupAnnotation(annot, contents)
+        self:resetTileCacheValidity()
     end
     page:close()
 end
@@ -260,9 +281,16 @@ function PdfDocument:writeDocument()
 end
 
 function PdfDocument:close()
-    if self.is_edited then
-        self:writeDocument()
+    -- NOTE: We can't just rely on Document:close's return code for that, as we need self._document
+    --       in :writeDocument, and it would have been destroyed.
+    local DocumentRegistry = require("document/documentregistry")
+    if DocumentRegistry:getReferenceCount(self.file) == 1 then
+        -- We're the final reference to this Document instance.
+        if self.is_edited then
+            self:writeDocument()
+        end
     end
+
     Document.close(self)
 end
 

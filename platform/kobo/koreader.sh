@@ -87,14 +87,19 @@ ko_update_check() {
     INSTALLED="${KOREADER_DIR}/ota/koreader.installed.tar"
     if [ -f "${NEWUPDATE}" ]; then
         ./fbink -q -y -7 -pmh "Updating KOReader"
+        # Setup the FBInk daemon
+        export FBINK_NAMED_PIPE="/tmp/koreader.fbink"
+        rm -f "${FBINK_NAMED_PIPE}"
+        FBINK_PID="$(./fbink --daemon 1 %KOREADER% -q -y -6 -P 0)"
         # NOTE: See frontend/ui/otamanager.lua for a few more details on how we squeeze a percentage out of tar's checkpoint feature
         # NOTE: %B should always be 512 in our case, so let stat do part of the maths for us instead of using %s ;).
         FILESIZE="$(stat -c %b "${NEWUPDATE}")"
         BLOCKS="$((FILESIZE / 20))"
         export CPOINTS="$((BLOCKS / 100))"
         # shellcheck disable=SC2016
-        ./tar xf "${NEWUPDATE}" --strip-components=1 --no-same-permissions --no-same-owner --checkpoint="${CPOINTS}" --checkpoint-action=exec='./fbink -q -y -6 -P $(($TAR_CHECKPOINT/$CPOINTS))'
+        ./tar xf "${NEWUPDATE}" --strip-components=1 --no-same-permissions --no-same-owner --checkpoint="${CPOINTS}" --checkpoint-action=exec='printf "%s" $((TAR_CHECKPOINT / CPOINTS)) > ${FBINK_NAMED_PIPE}'
         fail=$?
+        kill -TERM "${FBINK_PID}"
         # Cleanup behind us...
         if [ "${fail}" -eq 0 ]; then
             mv "${NEWUPDATE}" "${INSTALLED}"
@@ -110,8 +115,9 @@ ko_update_check() {
             ./fbink -q -y -6 -pmh "Update failed :("
             ./fbink -q -y -5 -pm "KOReader may fail to function properly!"
         fi
-        rm -f "${NEWUPDATE}" # always purge newupdate in all cases to prevent update loop
-        unset BLOCKS CPOINTS
+        rm -f "${NEWUPDATE}" # always purge newupdate to prevent update loops
+        unset CPOINTS FBINK_NAMED_PIPE
+        unset BLOCKS FILESIZE FBINK_PID
         # Ensure everything is flushed to disk before we restart. This *will* stall for a while on slow storage!
         sync
     fi
@@ -177,7 +183,7 @@ if [ "${VIA_NICKEL}" = "true" ]; then
     #       as we want to be able to use our own per-if processes w/ custom args later on.
     #       A SIGTERM does not break anything, it'll just prevent automatic lease renewal until the time
     #       KOReader actually sets the if up itself (i.e., it'll do)...
-    killall -q -TERM nickel hindenburg sickel fickel adobehost dhcpcd-dbus dhcpcd fmon
+    killall -q -TERM nickel hindenburg sickel fickel adobehost foxitpdf iink dhcpcd-dbus dhcpcd fmon
 
     # Wait for Nickel to die... (oh, procps with killall -w, how I miss you...)
     kill_timeout=0
@@ -235,6 +241,36 @@ if [ -z "${INTERFACE}" ]; then
     export INTERFACE
 fi
 
+# We'll enforce UR in ko_do_fbdepth, so make sure further FBInk usage (USBMS)
+# will also enforce UR... (Only actually meaningful on sunxi).
+if [ "${PLATFORM}" = "b300-ntx" ]; then
+    export FBINK_FORCE_ROTA=0
+    # And we also cannot use batched updates for the crash screens, as buffers are private,
+    # so each invocation essentially draws in a different buffer...
+    FBINK_BATCH_FLAG=""
+    # Same idea for backgroundless...
+    FBINK_BGLESS_FLAG="-B GRAY9"
+    # It also means we need explicit background padding in the OT codepath...
+    FBINK_OT_PADDING=",padding=BOTH"
+
+    # Make sure we poke the right input device
+    KOBO_TS_INPUT="/dev/input/by-path/platform-0-0010-event"
+else
+    FBINK_BATCH_FLAG="-b"
+    FBINK_BGLESS_FLAG="-O"
+    FBINK_OT_PADDING=""
+    KOBO_TS_INPUT="/dev/input/event1"
+fi
+
+# Make sure we only keep two cores online on the Elipsa.
+# NOTE: That's a bit optimistic, we might actually need to tone that down to one,
+#       and just toggle the second one on demand (e.g., PDF).
+if [ "${PRODUCT}" = "europa" ]; then
+    echo "1" >"/sys/devices/system/cpu/cpu1/online"
+    echo "0" >"/sys/devices/system/cpu/cpu2/online"
+    echo "0" >"/sys/devices/system/cpu/cpu3/online"
+fi
+
 # We'll want to ensure Portrait rotation to allow us to use faster blitting codepaths @ 8bpp,
 # so remember the current one before fbdepth does its thing.
 IFS= read -r ORIG_FB_ROTA <"/sys/class/graphics/fb0/rotate"
@@ -263,6 +299,15 @@ esac
 
 # The actual swap is done in a function, because we can disable it in the Developer settings, and we want to honor it on restart.
 ko_do_fbdepth() {
+    # On sunxi, the fb state is meaningless, and the minimal disp fb doesn't actually support 8bpp anyway,
+    # so just make sure we're set @ UR.
+    if [ "${PLATFORM}" = "b300-ntx" ]; then
+        echo "Making sure that rotation is set to Portrait" >>crash.log 2>&1
+        ./fbdepth -d 32 -R UR >>crash.log 2>&1
+
+        return
+    fi
+
     # Check if the swap has been disabled...
     if grep -q '\["dev_startup_no_fbdepth"\] = true' 'settings.reader.lua' 2>/dev/null; then
         # Swap back to the original bitdepth (in case this was a restart)
@@ -274,14 +319,14 @@ ko_do_fbdepth() {
                 ./fbdepth -d "${ORIG_FB_BPP}" -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
             else
                 echo "Making sure we're using the original fb bitdepth @ ${ORIG_FB_BPP}bpp, and that rotation is set to Portrait" >>crash.log 2>&1
-                ./fbdepth -d "${ORIG_FB_BPP}" -r -1 >>crash.log 2>&1
+                ./fbdepth -d "${ORIG_FB_BPP}" -R UR >>crash.log 2>&1
             fi
         fi
     else
         # Swap to 8bpp if things looke sane
         if [ -n "${ORIG_FB_BPP}" ]; then
             echo "Switching fb bitdepth to 8bpp & rotation to Portrait" >>crash.log 2>&1
-            ./fbdepth -d 8 -r -1 >>crash.log 2>&1
+            ./fbdepth -d 8 -R UR >>crash.log 2>&1
         fi
     fi
 }
@@ -357,21 +402,25 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
         # Height @ ~56.7%, w/ a margin worth 1.5 lines
         bombHeight=$((viewHeight / 2 + viewHeight / 15))
         bombMargin=$((FONTH + FONTH / 2))
+        # Start with a big gray screen of death, and our friendly old school crash icon ;)
+        # U+1F4A3, the hard way, because we can't use \u or \U escape sequences...
+        # shellcheck disable=SC2039,SC3003
+        ./fbink -q ${FBINK_BATCH_FLAG} -c -B GRAY9 -m -t regular=./fonts/freefont/FreeSerif.ttf,px=${bombHeight},top=${bombMargin} -W GL16 -- $'\xf0\x9f\x92\xa3'
         # With a little notice at the top of the screen, on a big gray screen of death ;).
-        ./fbink -q -b -c -B GRAY9 -m -y 1 "Don't Panic! (Crash n°${CRASH_COUNT} -> ${RETURN_VALUE})"
+        ./fbink -q ${FBINK_BATCH_FLAG} ${FBINK_BGLESS_FLAG} -m -y 1 "Don't Panic! (Crash n°${CRASH_COUNT} -> ${RETURN_VALUE})" -W GL16
         if [ ${CRASH_COUNT} -eq 1 ]; then
             # Warn that we're waiting on a tap to continue...
-            ./fbink -q -b -O -m -y 2 "Tap the screen to continue."
+            ./fbink -q ${FBINK_BATCH_FLAG} ${FBINK_BGLESS_FLAG} -m -y 2 "Tap the screen to continue." -W GL16
         fi
-        # U+1F4A3, the hard way, because we can't use \u or \U escape sequences...
-        # shellcheck disable=SC2039
-        ./fbink -q -b -O -m -t regular=./fonts/freefont/FreeSerif.ttf,px=${bombHeight},top=${bombMargin} -- $'\xf0\x9f\x92\xa3'
         # And then print the tail end of the log on the bottom of the screen...
         crashLog="$(tail -n 25 crash.log | sed -e 's/\t/    /g')"
         # The idea for the margins being to leave enough room for an fbink -Z bar, small horizontal margins, and a font size based on what 6pt looked like @ 265dpi
-        ./fbink -q -b -O -t regular=./fonts/droid/DroidSansMono.ttf,top=$((viewHeight / 2 + FONTH * 2 + FONTH / 2)),left=$((viewWidth / 60)),right=$((viewWidth / 60)),px=$((viewHeight / 64)) -- "${crashLog}"
-        # So far, we hadn't triggered an actual screen refresh, do that now, to make sure everything is bundled in a single flashing refresh.
-        ./fbink -q -f -s
+        # shellcheck disable=SC2086
+        ./fbink -q ${FBINK_BATCH_FLAG} ${FBINK_BGLESS_FLAG} -t regular=./fonts/droid/DroidSansMono.ttf,top=$((viewHeight / 2 + FONTH * 2 + FONTH / 2)),left=$((viewWidth / 60)),right=$((viewWidth / 60)),px=$((viewHeight / 64))${FBINK_OT_PADDING} -W GL16 -- "${crashLog}"
+        if [ "${PLATFORM}" != "b300-ntx" ]; then
+            # So far, we hadn't triggered an actual screen refresh, do that now, to make sure everything is bundled in a single flashing refresh.
+            ./fbink -q -f -s
+        fi
         # Cue a lemming's faceplant sound effect!
 
         {
@@ -388,8 +437,8 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
         if [ ${CRASH_COUNT} -eq 1 ]; then
             # NOTE: We don't actually care about what read read, we're just using it as a fancy sleep ;).
             #       i.e., we pause either until the 15s timeout, or until the user touches the screen.
-            # shellcheck disable=SC2039
-            read -r -t 15 </dev/input/event1
+            # shellcheck disable=SC2039,SC3045
+            read -r -t 15 <"${KOBO_TS_INPUT}"
         fi
         # Cycle the last crash timestamp
         CRASH_PREV_TS=${CRASH_TS}
